@@ -44,8 +44,8 @@ Ensure you have Python 3.8 or higher installed on your system.
 1. **Clone the repository:**
 
 ```bash
-git clone [https://github.com/SaptaZ/pdalife-scraper.git](https://github.com/SaptaZ/pdalife-scraper.git)
-cd pdalife-scraper
+git clone https://github.com/SaptaZ/PDALife-Scraper-API.git
+cd PDALife-Scraper-API
 
 ```
 
@@ -100,7 +100,7 @@ Verifies that the API is running.
 ```json
 {
   "message": "Search API for PDALife.com by Bowo",
-  "github": "[https://github.com/SaptaZ](https://github.com/SaptaZ)",
+  "github": "https://github.com/SaptaZ",
   "example_usage": "/search?query=minecraft&limit=5"
 }
 ```
