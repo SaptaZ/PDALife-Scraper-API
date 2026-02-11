@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application. Closing HTTPX client.")
     await client.aclose()
     logger.info("HTTPX client closed. Application stopped.")
-
+    
 app = FastAPI(title="PDALife Scraper", lifespan=lifespan)
 
 # ==========================================
@@ -173,6 +173,8 @@ async def fetch_until_success(url: str, validator_func) -> BeautifulSoup:
 async def scan_cdn_page_loop(dwn_url: str) -> str:
     """
     Logika pengambilan link dari MobDisc berdasarkan HTML yang diberikan.
+    Diperbarui untuk mengembalikan URL direct MobDisc (dw...) 
+    dan menangani proteksi 404.
     """
     logger.info(f"Scanning CDN page loop for: {dwn_url}")
     
@@ -186,37 +188,27 @@ async def scan_cdn_page_loop(dwn_url: str) -> str:
     
     if not soup:
         logger.warning(f"Failed to retrieve valid CDN page content for: {dwn_url}")
-        return None
+        return unwrap_google_url(dwn_url)
     
-    buttons = soup.select('a.b-download__button')
-    logger.info(f"Found {len(buttons)} download buttons on CDN page.")
+    # Dapatkan URL MobDisc yang sebenarnya (setelah redirect)
+    # Ini adalah link yang user inginkan (https://mobdisc.com/dw...)
+    # Kami mencoba mencarinya dari URL final setelah redirect.
+    final_mobdisc_url = dwn_url
     
-    for btn in buttons:
-        href = btn.get('href')
-        if not href: continue
-        
-        # Skip link Telegram
-        if "t.me" in href:
-            continue
-            
-        # Prioritaskan link yang mengandung /fdl/ (File Download Link)
-        if "/fdl/" in href:
-            logger.info(f"Found FDL link: {href}")
-            return unwrap_google_url(href)
-            
-        # Handle link yang diawali dengan #/download/ (MobDisc internal)
-        if href.startswith("#/download/"):
-            path = href[1:]
-            logger.info(f"Found internal MobDisc hash link: {path}")
-            return CDN_DOMAIN + path
-            
-        # Handle link download langsung lainnya yang bukan eksternal
-        if "http" in href and "mobdisc.com" in href:
-            logger.info(f"Found direct MobDisc link: {href}")
-            return href
-            
-    logger.warning("No valid download link found in CDN page buttons.")
-    return None
+    # Jika dwn_url adalah link /dwn/ di pdalife, kita butuh URL MobDisc aslinya.
+    # Karena fetch_until_success menggunakan follow_redirects=True, 
+    # kita tidak bisa langsung dapat res.url di sini.
+    # Namun, kita bisa merekonstruksinya atau melakukan HEAD request singkat.
+    try:
+        head_res = await client.head(dwn_url)
+        if head_res.status_code in [301, 302] and 'location' in head_res.headers:
+            final_mobdisc_url = head_res.headers['location']
+        elif head_res.status_code == 200:
+            final_mobdisc_url = str(head_res.url)
+    except:
+        pass
+
+    return unwrap_google_url(final_mobdisc_url)
 
 async def process_item_fully(name, detail_url, image):
     """
@@ -235,7 +227,7 @@ async def process_item_fully(name, detail_url, image):
             return None
 
         # 2. Ambil SEMUA elemen download yang tersedia
-        link_tags = []
+        link_items = []
         
         # Coba ambil dari list accordion (biasanya ada banyak versi)
         download_list_items = app_soup.select('.game-versions__downloads-list li')
@@ -243,31 +235,38 @@ async def process_item_fully(name, detail_url, image):
         if download_list_items:
             for item in download_list_items:
                 btn = item.select_one('a.game-versions__downloads-button')
+                size_tag = item.select_one('.game-versions__downloads-size')
                 if btn:
-                    link_tags.append(btn)
+                    link_items.append({
+                        "tag": btn,
+                        "size": size_tag.get_text(strip=True) if size_tag else ""
+                    })
         else:
             # Fallback: jika tidak ada list, coba ambil semua tombol download yang terlihat
             logger.info(f"No download list found for {name}, trying standalone buttons.")
             fallback_buttons = app_soup.select('a.game-versions__downloads-button')
-            link_tags.extend(fallback_buttons)
+            for btn in fallback_buttons:
+                # Cari size di parent atau tetangga jika standalone
+                size_tag = btn.select_one('.game-versions__downloads-size')
+                link_items.append({
+                    "tag": btn,
+                    "size": size_tag.get_text(strip=True) if size_tag else ""
+                })
 
-        if not link_tags:
+        if not link_items:
             logger.warning(f"No download link tags found for: {name}")
             return None
             
-        logger.info(f"Found {len(link_tags)} potential download links for {name}.")
+        logger.info(f"Found {len(link_items)} potential download links for {name}.")
 
-        final_data_list = []
-        main_size = "" # Kita ambil size dari link pertama saja sebagai referensi
+        final_links = []
+        final_sizes = []
 
         # 3. Loop dan proses setiap link yang ditemukan
-        for index, link_tag in enumerate(link_tags):
+        for index, item in enumerate(link_items):
+            link_tag = item["tag"]
+            item_size = item["size"]
             raw_link = link_tag.get('href')
-            
-            # Ambil ukuran file (hanya simpan yang pertama atau timpa, tapi di return kita pakai satu)
-            if index == 0:
-                size_tag = link_tag.select_one('.game-versions__downloads-size')
-                main_size = size_tag.get_text(strip=True) if size_tag else ""
             
             if not raw_link: continue
 
@@ -275,7 +274,8 @@ async def process_item_fully(name, detail_url, image):
             # Handle Magnet Link: Langsung simpan tanpa fetch/scan
             if raw_link.startswith("magnet:"):
                 logger.info(f"Magnet link detected for {name} [{index}]. Adding directly.")
-                final_data_list.append(raw_link)
+                final_links.append(raw_link)
+                final_sizes.append(item_size)
                 continue
             # === MODIFIKASI BERAKHIR DI SINI ===
 
@@ -301,22 +301,26 @@ async def process_item_fully(name, detail_url, image):
                     processed_link = direct_link
             
             if processed_link:
-                final_data_list.append(processed_link)
+                final_links.append(processed_link)
+                final_sizes.append(item_size)
 
-        if not final_data_list:
+        if not final_links:
             logger.warning(f"Final data list empty for {name} after processing all links.")
             return None
 
         # Gabungkan semua link dengan koma
-        joined_downloads = ", ".join(final_data_list)
-        logger.info(f"Successfully processed item: {name} with {len(final_data_list)} links.")
+        joined_downloads = ", ".join(final_links)
+        # Gabungkan size dengan koma, pastikan tidak ada trailing comma
+        joined_sizes = ", ".join([s for s in final_sizes if s])
+        
+        logger.info(f"Successfully processed item: {name} with {len(final_links)} links.")
         
         return {
             "name": name,
             "link": unwrap_google_url(detail_url),
             "image": image,
             "download": joined_downloads, # Hasil gabungan dipisah koma
-            "size": main_size 
+            "size": joined_sizes # Hasil gabungan size dipisah koma
         }
         
     except Exception as e:
